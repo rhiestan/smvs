@@ -2,6 +2,7 @@
   "name": "smvs",
   "version-string": "0",
   "dependencies": [
+    "highway",
     "libjpeg-turbo",
     "libpng",
     "mimalloc",

@@ -7,11 +7,8 @@
  * of the BSD 3-Clause license. See the LICENSE.txt file for details.
  */
 
-#if defined(__SSE4_1__)
-#   include <smmintrin.h> // SSE4_1
-#endif
-
 #include "gauss_newton_step.h"
+#include "gauss_newton_kernel.h"
 #include "surface_derivative.h"
 #include "conjugate_gradient.h"
 
@@ -251,89 +248,10 @@ GaussNewtonStep::fill_gradient_and_hessian_entries(std::size_t i,
 {
     double weight[2];
     
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
-    __m128d reg_grad_main = _mm_set_pd(grad_main[1], grad_main[0]);
-    static __m128d const sign_mask = _mm_set1_pd(-0.);
-    static __m128d const reg_rfactor = _mm_set1_pd(R_FACTOR);
-
-    reg_grad_mem.resize(16);
-    reg_hessian_mem.resize(256);
-
-    __m128d * reg_grad = reinterpret_cast<__m128d *>(*reg_grad_mem[0]);
-    __m128d * reg_hessian = reinterpret_cast<__m128d *>(*reg_hessian_mem[0]);
-
-    for (int col = 0; col < 16; ++col)
-        reg_grad[col] = _mm_setzero_pd();
-    for (int i = 0; i < 256; ++i)
-        reg_hessian[i] = _mm_setzero_pd();
-
-    for (std::size_t j = 0; j < num_subs; ++j)
-    {
-        __m128d reg_jgrad_sub = _mm_load_pd(*j_grad_subs[j]);
-        __m128d reg_diff = _mm_sub_pd(reg_jgrad_sub, reg_grad_main);
-        __m128d reg_weight = _mm_add_pd(_mm_andnot_pd(sign_mask, reg_diff),
-            reg_rfactor);
-
-        __m128d * reg_jcol = reinterpret_cast<__m128d *>(*jac_entries[j * 16]);
-        for (int col = 0; col < 16; ++col, ++reg_jcol)
-        {
-            reg_grad[col] = _mm_add_pd(reg_grad[col], _mm_div_pd(
-                _mm_mul_pd(reg_diff, *reg_jcol), reg_weight));
-            __m128d * reg_jcol2 = reinterpret_cast<__m128d *>(
-                *jac_entries[j * 16 + col]);
-
-            for (int col2 = col; col2 < 16; ++col2, ++reg_jcol2)
-                reg_hessian[col * 16 + col2] =
-                    _mm_add_pd(reg_hessian[col * 16 + col2],
-                        _mm_mul_pd(*reg_jcol,
-                            _mm_div_pd(*reg_jcol2, reg_weight)));
-        }
-
-        for (std::size_t j2 = j + 1; j2 < num_subs; ++j2)
-        {
-            __m128d reg_jgrad_sub2 = _mm_load_pd(*j_grad_subs[j2]);
-            __m128d reg_subdiff = _mm_sub_pd(reg_jgrad_sub, reg_jgrad_sub2);
-            __m128d reg_subweight = _mm_add_pd(
-                _mm_andnot_pd(sign_mask, reg_subdiff), reg_rfactor);
-
-            __m128d * reg_jcol = reinterpret_cast<__m128d *>(
-                *jac_entries[j * 16]);
-            __m128d * reg_j2col = reinterpret_cast<__m128d *>(
-                *jac_entries[j2 * 16]);
-            for (int col = 0; col < 16; ++col, ++reg_jcol, ++reg_j2col)
-            {
-                __m128d reg_jace = _mm_div_pd(_mm_sub_pd(*reg_jcol, *reg_j2col),
-                     reg_subweight);
-
-                reg_grad[col] = _mm_add_pd(reg_grad[col],
-                    _mm_mul_pd(reg_jace, reg_subdiff));
-
-                __m128d * reg_jcol2 = reinterpret_cast<__m128d *>(
-                    *jac_entries[j * 16 + col]);
-                __m128d * reg_j2col2 = reinterpret_cast<__m128d *>(
-                    *jac_entries[j2 * 16 + col]);
-                for (int col2 = col; col2 < 16; ++col2,
-                     ++reg_jcol2, ++reg_j2col2)
-                    reg_hessian[col * 16 + col2] =
-                        _mm_add_pd(reg_hessian[col * 16 + col2],
-                            _mm_mul_pd(reg_jace,
-                                _mm_sub_pd(*reg_jcol2, *reg_j2col2)));
-            }
-        }
-    }
-    
-    for (int col = 0; col < 16; ++col)
-        gradient[col] += reg_grad_mem[col][0] + reg_grad_mem[col][1];
-
-    for (int col = 0; col < 16; ++col)
-       for (int col2 = col; col2 < 16; ++col2)
-        {
-            hessian_entries[col * 16 + col2] +=
-                reg_hessian_mem[col * 16 + col2][0] +
-                reg_hessian_mem[col * 16 + col2][1];
-        }
-    
-#else /* No SSE4 Support */
+#ifdef SMVS_USE_HIGHWAY
+    gauss_newton_accumulate(num_subs, *jac_entries[0], *j_grad_subs[0],
+        *grad_main, R_FACTOR, gradient, hessian_entries);
+#else /* No Highway */
     double subweight[2];
     double diff[2];
     double subdiff[2];
@@ -382,7 +300,7 @@ GaussNewtonStep::fill_gradient_and_hessian_entries(std::size_t i,
             }
         }
     }
-#endif /* SSE3 Support */
+#endif /* SMVS_USE_HIGHWAY */
     
     if (this->opts.regularization <= 0.0)
         return;
@@ -398,6 +316,11 @@ GaussNewtonStep::fill_gradient_and_hessian_entries(std::size_t i,
         if (this->lighting!= nullptr)
             geom_weight *= this->opts.light_surf_regularization / 100;
 
+#ifdef SMVS_USE_HIGHWAY
+        gauss_newton_regularize(full_surface_div, full_surface_div_deriv,
+            basic_regularizer_weight, geom_weight, R_FACTOR, gradient,
+            hessian_entries);
+#else
         for (int v = 0; v < 6; ++v)
         {
             double const weight = geom_weight /
@@ -415,6 +338,7 @@ GaussNewtonStep::fill_gradient_and_hessian_entries(std::size_t i,
                         basic_regularizer_weight * weight;
             }
         }
+#endif
         if (this->lighting == nullptr)
             return;
     }

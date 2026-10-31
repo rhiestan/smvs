@@ -380,35 +380,58 @@ SGMStereo::fill_path_cost_sse (int base, int pbase,
     uint16_t const penalty1 = this->opts.penalty1;
     uint16_t const penalty2 = this->opts.penalty2;
 
+    uint16_t * const path_prev = &path->at(pbase);
+    uint16_t * const path_cur = &path->at(base);
+    uint16_t * const min_updates = &this->min_cost_updates[0];
+    uint16_t const* const cost = &this->sse_cost_volume[base];
+    uint16_t * const sgm = &this->sse_sgm_volume[base];
+
     /* Find minmal cost in prev */
-    uint16_t min_prev_cost = sse_reduction_min(&path->at(pbase), d_stride);
+    uint16_t min_prev_cost = sse_reduction_min(path_prev, d_stride);
 
-    for (int idx = 0; idx < d_stride; idx += 1)
+    /* Cheapest way to reach step idx: stay (idx), move by one step (penalty1)
+     * or jump from any other step (penalty2). As penalty1 <= penalty2, the
+     * jump can start at the global minimum, which is equivalent to the
+     * minimum over all non-neighboring steps. */
+    uint16_t const jump_cost = static_cast<uint16_t>(min_prev_cost + penalty2);
+    if (penalty1 <= penalty2)
     {
-        for (int idx2 = 0; idx2 < d_stride; ++idx2)
-            this->cost_updates[idx2] =
-                static_cast<uint16_t>(path->at(pbase + idx2) + penalty2);
-
-        this->cost_updates[idx] = path->at(pbase + idx);
-        if (idx > 0)
-            this->cost_updates[idx - 1] = static_cast<uint16_t>(
-                path->at(pbase + idx - 1) + penalty1);
-        if (idx < d_stride - 1)
-            this->cost_updates[idx + 1] = static_cast<uint16_t>(
-                path->at(pbase + idx + 1) + penalty1);
-
-        min_cost_updates[idx] = sse_reduction_min(&this->cost_updates[0],
-            d_stride);
+        for (int idx = 0; idx < d_stride; ++idx)
+        {
+            uint16_t update = std::min(path_prev[idx], jump_cost);
+            if (idx > 0)
+                update = std::min(update, static_cast<uint16_t>(
+                    path_prev[idx - 1] + penalty1));
+            if (idx < d_stride - 1)
+                update = std::min(update, static_cast<uint16_t>(
+                    path_prev[idx + 1] + penalty1));
+            min_updates[idx] = update;
+        }
+    }
+    else
+    {
+        uint16_t * const updates = &this->cost_updates[0];
+        for (int idx = 0; idx < d_stride; ++idx)
+        {
+            for (int idx2 = 0; idx2 < d_stride; ++idx2)
+                updates[idx2] = static_cast<uint16_t>(path_prev[idx2] + penalty2);
+            updates[idx] = path_prev[idx];
+            if (idx > 0)
+                updates[idx - 1] = static_cast<uint16_t>(
+                    path_prev[idx - 1] + penalty1);
+            if (idx < d_stride - 1)
+                updates[idx + 1] = static_cast<uint16_t>(
+                    path_prev[idx + 1] + penalty1);
+            min_updates[idx] = sse_reduction_min(updates, d_stride);
+        }
     }
 
     for (int idx = 0; idx < d_stride; ++idx)
     {
         uint16_t const path_cost = static_cast<uint16_t>(
-            this->sse_cost_volume[base + idx] + min_cost_updates[idx]
-            - min_prev_cost);
-        path->at(base + idx) = path_cost;
-        this->sse_sgm_volume[base + idx] = static_cast<uint16_t>(
-            this->sse_sgm_volume[base + idx] + path_cost);
+            cost[idx] + min_updates[idx] - min_prev_cost);
+        path_cur[idx] = path_cost;
+        sgm[idx] = static_cast<uint16_t>(sgm[idx] + path_cost);
     }
 }
 
