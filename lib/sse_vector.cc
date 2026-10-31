@@ -10,7 +10,9 @@
 #include "sse_vector.h"
 
 #include <stdexcept>
-#include <smmintrin.h> // SSE4_1
+#if defined(__SSE4_1__)
+#   include <smmintrin.h> // SSE4_1
+#endif
 
 #define ENABLE_SSE_VECTOR 1
 

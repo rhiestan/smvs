@@ -8,12 +8,7 @@
  */
 
 #include <iostream>
-#include <smmintrin.h> // SSE4_1
-#if defined(_WIN32)
-#   include <nmmintrin.h> // for hamming distance
-#else // Linux, OSX, ...
-#   include <popcntintrin.h> // for hamming distance
-#endif
+#include <cstdint>
 
 #include "mve/depthmap.h"
 #include "mve/image_tools.h"
@@ -23,6 +18,23 @@
 #include "correspondence.h"
 
 SMVS_NAMESPACE_BEGIN
+
+namespace
+{
+    /* Hamming weight of a census difference. */
+    inline int
+    popcount64 (uint64_t value)
+    {
+#if defined(__GNUC__) || defined(__clang__)
+        return __builtin_popcountll(value);
+#else
+        int count = 0;
+        for (; value != 0; value &= value - 1)
+            count += 1;
+        return count;
+#endif
+    }
+}
 
 SGMStereo::SGMStereo (Options const& opts, StereoView::Ptr main,
     StereoView::Ptr neighbor)
@@ -210,7 +222,7 @@ SGMStereo::create_cost_volume (float min_depth, float max_depth, int num_steps)
         main_image->width(), main_image->height(), 1);
     this->census_filter(main_image, main_census);
 
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
     std::size_t const volume_size = main_census->width() *
         main_census->height() * num_steps;
     this->sse_cost_volume.resize(volume_size, 255);
@@ -231,10 +243,10 @@ SGMStereo::create_cost_volume (float min_depth, float max_depth, int num_steps)
                 continue;
 
             /* hamming distance between census values */
-            uint8_t count = _mm_popcnt_u64(
+            uint8_t count = popcount64(
                 main_census->at(p) ^ n_warped_census->at(p, i));
 
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
             this->sse_cost_volume.at(p * num_steps + i) = count;
 #else
             this->cost_volume->at(p, i) = count;
@@ -286,7 +298,7 @@ SGMStereo::depth_from_sgm_volume (void)
             int min_index = 0;
             for (int i = 0; i < num_steps; ++i)
             {
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
                 uint16_t const value = this->sse_sgm_volume[p * num_steps + i];
 #else
                 uint16_t const value = this->sgm_volume->at(p, i);
@@ -345,17 +357,19 @@ SGMStereo::fill_path_cost(int x, int y, int px, int py, mve::RawImage::Ptr path)
     }
 }
 
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
+/*
+ * The "sse" functions work on cost volumes that are packed as one array of
+ * 16 bit values per pixel and disparity step. They are plain loops; the
+ * 16 bit arithmetic wraps around as the SSE instructions did.
+ */
 uint16_t
 SGMStereo::sse_reduction_min (uint16_t * data, std::size_t size)
 {
-    __m128i const* data_ptr = reinterpret_cast<__m128i const*>(data);
-    __m128i * min_ptr = reinterpret_cast<__m128i*>(this->mins.data());
-    *min_ptr = _mm_load_si128(data_ptr++);
-    for (std::size_t idx = 8; idx < size; idx += 8, ++data_ptr)
-        *min_ptr = _mm_min_epu16(*min_ptr, *data_ptr);
-    *min_ptr = _mm_minpos_epu16(*min_ptr);
-    return this->mins[0];
+    uint16_t min = data[0];
+    for (std::size_t idx = 1; idx < size; ++idx)
+        min = std::min(min, data[idx]);
+    return min;
 }
 
 void
@@ -371,37 +385,30 @@ SGMStereo::fill_path_cost_sse (int base, int pbase,
 
     for (int idx = 0; idx < d_stride; idx += 1)
     {
-        __m128i pen = _mm_set1_epi16(penalty2);
-        __m128i * path_ptr = reinterpret_cast<__m128i *>(&path->at(pbase));
-        __m128i * cu_ptr = reinterpret_cast<__m128i *>(cost_updates.data());
-        for (int idx2 = 0; idx2 < d_stride; idx2 += 8, ++path_ptr, ++cu_ptr)
-            *cu_ptr = _mm_add_epi16(*path_ptr, pen);
+        for (int idx2 = 0; idx2 < d_stride; ++idx2)
+            this->cost_updates[idx2] =
+                static_cast<uint16_t>(path->at(pbase + idx2) + penalty2);
 
         this->cost_updates[idx] = path->at(pbase + idx);
         if (idx > 0)
-            this->cost_updates[idx - 1] = path->at(pbase + idx - 1) + penalty1;
+            this->cost_updates[idx - 1] = static_cast<uint16_t>(
+                path->at(pbase + idx - 1) + penalty1);
         if (idx < d_stride - 1)
-            this->cost_updates[idx + 1] = path->at(pbase + idx + 1) + penalty1;
+            this->cost_updates[idx + 1] = static_cast<uint16_t>(
+                path->at(pbase + idx + 1) + penalty1);
 
         min_cost_updates[idx] = sse_reduction_min(&this->cost_updates[0],
             d_stride);
     }
 
-    __m128i min_prev = _mm_set1_epi16(min_prev_cost);
-    __m128i const* cost_vol_ptr = reinterpret_cast<__m128i const*>(
-        &this->sse_cost_volume[base]);
-    __m128i const* cost_upd_ptr = reinterpret_cast<__m128i const*>(
-        &min_cost_updates[0]);
-    __m128i * sgm_vol_ptr = reinterpret_cast<__m128i *>(
-        &this->sse_sgm_volume[base]);
-    __m128i * path_ptr = reinterpret_cast<__m128i *>(&path->at(base));
-
-    for (int idx = 0; idx < d_stride; idx += 8, ++cost_vol_ptr, ++cost_upd_ptr,
-         ++sgm_vol_ptr, ++path_ptr)
+    for (int idx = 0; idx < d_stride; ++idx)
     {
-        *path_ptr = _mm_add_epi16(*cost_vol_ptr, *cost_upd_ptr);
-        *path_ptr = _mm_sub_epi16(*path_ptr, min_prev);
-        *sgm_vol_ptr = _mm_add_epi16(*sgm_vol_ptr, *path_ptr);
+        uint16_t const path_cost = static_cast<uint16_t>(
+            this->sse_cost_volume[base + idx] + min_cost_updates[idx]
+            - min_prev_cost);
+        path->at(base + idx) = path_cost;
+        this->sse_sgm_volume[base + idx] = static_cast<uint16_t>(
+            this->sse_sgm_volume[base + idx] + path_cost);
     }
 }
 
@@ -413,16 +420,10 @@ SGMStereo::copy_cost_and_add_to_sgm(util::AlignedMemory<uint16_t> *local_volume,
     std::copy(&this->sse_cost_volume[base], &this->sse_cost_volume[base +
         d_stride], &local_volume->at(base));
 
-    for (int disp = 0; disp < d_stride; disp += 8)
-    {
-        __m128i cost = _mm_loadu_si128(reinterpret_cast<__m128i const*>(
-            &this->sse_cost_volume[base + disp]));
-        __m128i sgm = _mm_loadu_si128(reinterpret_cast<__m128i const*>(
-            &this->sse_sgm_volume[base + disp]));
-        __m128i sum = _mm_add_epi16(sgm, cost);
-        _mm_storeu_si128(reinterpret_cast<__m128i *>(
-            &this->sse_sgm_volume[base + disp]), sum);
-    }
+    for (int disp = 0; disp < d_stride; ++disp)
+        this->sse_sgm_volume[base + disp] = static_cast<uint16_t>(
+            this->sse_sgm_volume[base + disp]
+            + this->sse_cost_volume[base + disp]);
 }
 #endif
 
@@ -432,7 +433,7 @@ SGMStereo::aggregate_sgm_costs (void)
     int const width = this->main_image->width();
     int const height = this->main_image->height();
 
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
     int const d_stride = this->opts.num_steps;
     int const y_stride = this->main_image->width();
     this->sse_sgm_volume.resize(this->sse_cost_volume.size(), 0);
@@ -454,7 +455,7 @@ SGMStereo::aggregate_sgm_costs (void)
 #endif
 
     /* process left-to-right */
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
     std::fill(sse_local_volume.begin(), sse_local_volume.end(), 0);
     for (int y = 0; y < height; ++y)
     {
@@ -480,7 +481,7 @@ SGMStereo::aggregate_sgm_costs (void)
 #endif
 
     /* process right-to-left */
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
     std::fill(sse_local_volume.begin(), sse_local_volume.end(), 0);
     for (int y = 0; y < height; ++y)
     {
@@ -508,7 +509,7 @@ SGMStereo::aggregate_sgm_costs (void)
 #endif
 
     /* process top-to-bottom */
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
     std::fill(sse_local_volume.begin(), sse_local_volume.end(), 0);
     std::fill(sse_local_volume_d1.begin(), sse_local_volume_d1.end(), 0);
     std::fill(sse_local_volume_d2.begin(), sse_local_volume_d2.end(), 0);
@@ -586,7 +587,7 @@ SGMStereo::aggregate_sgm_costs (void)
 #endif
 
     /* process bottom-to-top */
-#if SMVS_ENABLE_SSE && defined(__SSE4_1__)
+#if SMVS_ENABLE_SSE
     std::fill(sse_local_volume.begin(), sse_local_volume.end(), 0);
     std::fill(sse_local_volume_d1.begin(), sse_local_volume_d1.end(), 0);
     std::fill(sse_local_volume_d2.begin(), sse_local_volume_d2.end(), 0);

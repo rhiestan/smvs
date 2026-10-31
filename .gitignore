@@ -37,3 +37,8 @@
 app/smvsrecon
 smvsrecon
 tests/test
+
+# CMake
+build/
+.vs/
+.cache/

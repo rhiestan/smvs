@@ -7,7 +7,9 @@
  * of the BSD 3-Clause license. See the LICENSE.txt file for details.
  */
 
-#include <smmintrin.h> // SSE4_1
+#if defined(__SSE4_1__)
+#   include <smmintrin.h> // SSE4_1
+#endif
 
 #include "gauss_newton_step.h"
 #include "surface_derivative.h"
